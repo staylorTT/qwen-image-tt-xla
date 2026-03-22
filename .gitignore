@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+venv/
+
+# Model weights (54GB+)
+weights/
+
+# Generated outputs
+generated/
+*.png
+
+# Editor/IDE
+.vscode/
+.idea/
