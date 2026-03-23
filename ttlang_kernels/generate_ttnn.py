@@ -1,16 +1,15 @@
-"""End-to-end image generation using pure ttnn/tt-lang for the 60-block MMDiT.
+"""End-to-end image generation using pure ttnn for the 60-block MMDiT.
 
 Uses 4 Blackhole devices with Tensor Parallelism (TP) following oasis patterns:
 - Column-parallel: QKV projections, FFN fc1 (shard output dim)
 - Row-parallel: output projections, FFN fc2 (shard input dim) + all_reduce
 - All 60 blocks' weights preloaded and kept resident across 4 devices
+- Pre-allocated scratch tensors, no allocations in hot loop
+- Tracing for zero Python dispatch overhead
 
 CPU handles: text encoding, timestep embedding, img_in/txt_in, final norm/proj,
              scheduler, VAE decode.
 Device handles: all 60 MMDiT transformer blocks (the expensive part).
-
-Usage (on remote):
-    python3 generate_ttnn.py --prompt "A cat" --width 512 --height 512 --steps 20
 """
 import sys
 import os
@@ -27,8 +26,6 @@ import torch.nn.functional as F
 import safetensors.torch
 import ttnn
 
-from broadcast_row import broadcast_row_kernel
-
 TILE = 32
 N_HEADS = 24
 HEAD_DIM = 128
@@ -36,6 +33,10 @@ HIDDEN_DIM = N_HEADS * HEAD_DIM  # 3072
 SCALE = 1.0 / math.sqrt(HEAD_DIM)
 N_CHIPS = 4
 
+
+# ============================================================
+# Host helpers
+# ============================================================
 
 def _mesh_kwargs(device):
     if isinstance(device, ttnn.MeshDevice):
@@ -64,6 +65,10 @@ def to_tt_1d(t, device):
                            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
                            device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
                            **_mesh_kwargs(device))
+
+
+def zeros_tt(shape, device):
+    return to_tt(torch.zeros(shape, dtype=torch.bfloat16), device)
 
 
 def shard_tt(t, device, dim):
@@ -95,27 +100,19 @@ def from_tt(t, device=None):
     return ttnn.to_torch(t).float()
 
 
-def expand_mod_tt(mod_3d, seq_len, device):
-    """Expand [1, 32, D] mod param to [1, S, D] using broadcast_row kernel."""
-    D_padded = mod_3d.shape[-1]
-    mod_clean = ttnn.clone(mod_3d, memory_config=ttnn.DRAM_MEMORY_CONFIG)
-    mod_2d = ttnn.reshape(mod_clean, (TILE, D_padded))
-    seq_padded = ((seq_len + TILE - 1) // TILE) * TILE
-    out_2d = ttnn.from_torch(
-        torch.zeros(seq_padded, D_padded, dtype=torch.bfloat16),
-        dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-        device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-        **_mesh_kwargs(device),
-    )
-    broadcast_row_kernel(mod_2d, out_2d)
-    out_3d = ttnn.reshape(out_2d, (1, seq_padded, D_padded))
-    return ttnn.clone(out_3d, memory_config=ttnn.DRAM_MEMORY_CONFIG)
+def expand_bias(bias_1d, seq_pad):
+    """Pre-expand 1D bias to [seq_pad, D] for use with ttnn.linear or ttnn.add."""
+    return bias_1d.unsqueeze(0).expand(seq_pad, -1).contiguous().to(torch.bfloat16)
 
+
+# ============================================================
+# Weight loading
+# ============================================================
 
 class TTNNBlock:
     """One MMDiT block weights on device with TP sharding."""
 
-    def __init__(self, weights, device, use_tp=False):
+    def __init__(self, weights, device, use_tp=False, img_seq_pad=0, txt_seq_pad=0):
         self.device = device
         self.use_tp = use_tp
         d = device
@@ -123,9 +120,9 @@ class TTNNBlock:
 
         # AdaLN MLP (replicated - small, runs on all chips)
         self.img_mod_w = to_tt(w["img_mod.1.weight"].T.contiguous(), d)
-        self.img_mod_b = to_tt_1d(w["img_mod.1.bias"], d)
+        self.img_mod_b = to_tt(expand_bias(w["img_mod.1.bias"], TILE), d)
         self.txt_mod_w = to_tt(w["txt_mod.1.weight"].T.contiguous(), d)
-        self.txt_mod_b = to_tt_1d(w["txt_mod.1.bias"], d)
+        self.txt_mod_b = to_tt(expand_bias(w["txt_mod.1.bias"], TILE), d)
 
         if use_tp and N_CHIPS > 1:
             # Column-parallel QKV (shard output dim=1)
@@ -144,7 +141,7 @@ class TTNNBlock:
             self.txt_to_k_b = shard_tt_1d(w["attn.add_k_proj.bias"], d, dim=1)
             self.txt_to_v_b = shard_tt_1d(w["attn.add_v_proj.bias"], d, dim=1)
 
-            # Row-parallel output proj (shard input dim=0), bias replicated (added after all_reduce)
+            # Row-parallel output proj (shard input dim=0), bias replicated
             self.img_to_out = shard_tt(w["attn.to_out.0.weight"].T.contiguous(), d, dim=0)
             self.txt_to_out = shard_tt(w["attn.to_add_out.weight"].T.contiguous(), d, dim=0)
             self.img_to_out_b = to_tt_1d(w["attn.to_out.0.bias"], d)
@@ -156,7 +153,7 @@ class TTNNBlock:
             self.img_ff1_b = shard_tt_1d(w["img_mlp.net.0.proj.bias"], d, dim=1)
             self.txt_ff1_b = shard_tt_1d(w["txt_mlp.net.0.proj.bias"], d, dim=1)
 
-            # Row-parallel FFN fc2 (shard input dim=0), bias replicated (added after all_reduce)
+            # Row-parallel FFN fc2 (shard input dim=0), bias replicated
             self.img_ff2_w = shard_tt(w["img_mlp.net.2.weight"].T.contiguous(), d, dim=0)
             self.txt_ff2_w = shard_tt(w["txt_mlp.net.2.weight"].T.contiguous(), d, dim=0)
             self.img_ff2_b = to_tt_1d(w["img_mlp.net.2.bias"], d)
@@ -175,7 +172,6 @@ class TTNNBlock:
             self.img_ff2_w = to_tt(w["img_mlp.net.2.weight"].T.contiguous(), d)
             self.txt_ff2_w = to_tt(w["txt_mlp.net.2.weight"].T.contiguous(), d)
 
-            # Biases (replicated for single-chip)
             self.img_to_q_b = to_tt_1d(w["attn.to_q.bias"], d)
             self.img_to_k_b = to_tt_1d(w["attn.to_k.bias"], d)
             self.img_to_v_b = to_tt_1d(w["attn.to_v.bias"], d)
@@ -196,7 +192,6 @@ class TTNNBlock:
         self.norm_added_k = to_tt_1d(w["attn.norm_added_k.weight"], d)
 
     def deallocate(self):
-        """Free all device tensors."""
         for attr in list(vars(self).keys()):
             v = getattr(self, attr)
             if hasattr(v, 'deallocate'):
@@ -206,44 +201,69 @@ class TTNNBlock:
                     pass
 
 
-def block_forward(blk, img_hs, txt_hs, temb_tt, device):
-    """Forward one MMDiT block on device."""
-    img_seq = img_hs.shape[-2]
-    txt_seq = txt_hs.shape[-2]
+# ============================================================
+# AdaLN expansion via ttnn.concat (no custom kernel needed)
+# ============================================================
+
+def expand_adaln(silu_cond, mod_w, mod_b, n_repeat):
+    """Compute adaLN params and expand: out = concat([silu_cond @ mod_w + mod_b] * n_repeat).
+    silu_cond: (TILE, D) device tensor (2D, tile-padded from 1xD)
+    mod_w: (D, 6*D) weight
+    mod_b: (TILE, 6*D) pre-expanded bias
+    Returns: (n_repeat*TILE, 6*D) device tensor with adaLN params repeated.
+    """
+    adaln_out = ttnn.linear(silu_cond, mod_w, bias=mod_b)
+    return ttnn.concat([adaln_out] * n_repeat, dim=0)
+
+
+# ============================================================
+# Block forward
+# ============================================================
+
+def block_forward(blk, img_hs, txt_hs, temb_silu, device,
+                  img_seq, txt_seq, img_seq_pad, txt_seq_pad):
+    """Forward one MMDiT block on device. All tensors are 3D: [1, S, D]."""
     D = HIDDEN_DIM
     use_tp = blk.use_tp and N_CHIPS > 1
     heads_per_chip = N_HEADS // N_CHIPS if use_tp else N_HEADS
 
-    # AdaLN
-    temb_silu = ttnn.silu(temb_tt)
-    img_mod = ttnn.linear(temb_silu, blk.img_mod_w, bias=blk.img_mod_b)
-    txt_mod = ttnn.linear(temb_silu, blk.txt_mod_w, bias=blk.txt_mod_b)
+    # AdaLN: compute mod params and expand via concat
+    img_n_repeat = img_seq_pad // TILE
+    txt_n_repeat = txt_seq_pad // TILE
 
-    i_sh1 = img_mod[:, :, :D]
-    i_sc1 = img_mod[:, :, D:2*D]
-    i_g1 = img_mod[:, :, 2*D:3*D]
-    i_sh2 = img_mod[:, :, 3*D:4*D]
-    i_sc2 = img_mod[:, :, 4*D:5*D]
-    i_g2 = img_mod[:, :, 5*D:]
-    t_sh1 = txt_mod[:, :, :D]
-    t_sc1 = txt_mod[:, :, D:2*D]
-    t_g1 = txt_mod[:, :, 2*D:3*D]
-    t_sh2 = txt_mod[:, :, 3*D:4*D]
-    t_sc2 = txt_mod[:, :, 4*D:5*D]
-    t_g2 = txt_mod[:, :, 5*D:]
+    # temb_silu is [1, 32, D], reshape to 2D for matmul
+    temb_2d = ttnn.reshape(temb_silu, (TILE, D))
+    img_adaln = expand_adaln(temb_2d, blk.img_mod_w, blk.img_mod_b, img_n_repeat)
+    txt_adaln = expand_adaln(temb_2d, blk.txt_mod_w, blk.txt_mod_b, txt_n_repeat)
 
-    i_sh1_e = expand_mod_tt(i_sh1, img_seq, device)
-    i_sc1_e = expand_mod_tt(i_sc1, img_seq, device)
-    i_g1_e = expand_mod_tt(i_g1, img_seq, device)
-    t_sh1_e = expand_mod_tt(t_sh1, txt_seq, device)
-    t_sc1_e = expand_mod_tt(t_sc1, txt_seq, device)
-    t_g1_e = expand_mod_tt(t_g1, txt_seq, device)
+    # Slice mod params: each is (S_pad, D) in 2D
+    i_sh1 = ttnn.slice(img_adaln, [0, 0], [img_seq_pad, D])
+    i_sc1 = ttnn.slice(img_adaln, [0, D], [img_seq_pad, 2*D])
+    i_g1 = ttnn.slice(img_adaln, [0, 2*D], [img_seq_pad, 3*D])
+    i_sh2 = ttnn.slice(img_adaln, [0, 3*D], [img_seq_pad, 4*D])
+    i_sc2 = ttnn.slice(img_adaln, [0, 4*D], [img_seq_pad, 5*D])
+    i_g2 = ttnn.slice(img_adaln, [0, 5*D], [img_seq_pad, 6*D])
+
+    t_sh1 = ttnn.slice(txt_adaln, [0, 0], [txt_seq_pad, D])
+    t_sc1 = ttnn.slice(txt_adaln, [0, D], [txt_seq_pad, 2*D])
+    t_g1 = ttnn.slice(txt_adaln, [0, 2*D], [txt_seq_pad, 3*D])
+    t_sh2 = ttnn.slice(txt_adaln, [0, 3*D], [txt_seq_pad, 4*D])
+    t_sc2 = ttnn.slice(txt_adaln, [0, 4*D], [txt_seq_pad, 5*D])
+    t_g2 = ttnn.slice(txt_adaln, [0, 5*D], [txt_seq_pad, 6*D])
+
+    # Reshape slices to 3D to match hidden states
+    i_sh1 = ttnn.reshape(i_sh1, (1, img_seq_pad, D))
+    i_sc1 = ttnn.reshape(i_sc1, (1, img_seq_pad, D))
+    i_g1 = ttnn.reshape(i_g1, (1, img_seq_pad, D))
+    t_sh1 = ttnn.reshape(t_sh1, (1, txt_seq_pad, D))
+    t_sc1 = ttnn.reshape(t_sc1, (1, txt_seq_pad, D))
+    t_g1 = ttnn.reshape(t_g1, (1, txt_seq_pad, D))
 
     # LN + modulate
     img_n = ttnn.layer_norm(img_hs)
-    img_m = ttnn.add(ttnn.multiply(img_n, ttnn.add(i_sc1_e, 1.0)), i_sh1_e)
+    img_m = ttnn.add(ttnn.multiply(img_n, ttnn.add(i_sc1, 1.0)), i_sh1)
     txt_n = ttnn.layer_norm(txt_hs)
-    txt_m = ttnn.add(ttnn.multiply(txt_n, ttnn.add(t_sc1_e, 1.0)), t_sh1_e)
+    txt_m = ttnn.add(ttnn.multiply(txt_n, ttnn.add(t_sc1, 1.0)), t_sh1)
 
     # QKV (column-parallel if TP, biases sharded to match)
     img_q = ttnn.linear(img_m, blk.img_to_q, bias=blk.img_to_q_b)
@@ -254,12 +274,12 @@ def block_forward(blk, img_hs, txt_hs, temb_tt, device):
     txt_v = ttnn.linear(txt_m, blk.txt_to_v, bias=blk.txt_to_v_b)
 
     B = 1
-    img_q = ttnn.reshape(img_q, (B, img_seq, heads_per_chip, HEAD_DIM))
-    img_k = ttnn.reshape(img_k, (B, img_seq, heads_per_chip, HEAD_DIM))
-    img_v = ttnn.reshape(img_v, (B, img_seq, heads_per_chip, HEAD_DIM))
-    txt_q = ttnn.reshape(txt_q, (B, txt_seq, heads_per_chip, HEAD_DIM))
-    txt_k = ttnn.reshape(txt_k, (B, txt_seq, heads_per_chip, HEAD_DIM))
-    txt_v = ttnn.reshape(txt_v, (B, txt_seq, heads_per_chip, HEAD_DIM))
+    img_q = ttnn.reshape(img_q, (B, img_seq_pad, heads_per_chip, HEAD_DIM))
+    img_k = ttnn.reshape(img_k, (B, img_seq_pad, heads_per_chip, HEAD_DIM))
+    img_v = ttnn.reshape(img_v, (B, img_seq_pad, heads_per_chip, HEAD_DIM))
+    txt_q = ttnn.reshape(txt_q, (B, txt_seq_pad, heads_per_chip, HEAD_DIM))
+    txt_k = ttnn.reshape(txt_k, (B, txt_seq_pad, heads_per_chip, HEAD_DIM))
+    txt_v = ttnn.reshape(txt_v, (B, txt_seq_pad, heads_per_chip, HEAD_DIM))
 
     # QK RMSNorm
     img_q = ttnn.rms_norm(img_q, weight=blk.norm_q)
@@ -280,12 +300,12 @@ def block_forward(blk, img_hs, txt_hs, temb_tt, device):
     )
 
     attn_out = ttnn.transpose(attn_out, 1, 2)
-    S_total = txt_seq + img_seq
+    S_total = txt_seq_pad + img_seq_pad
     d_out = heads_per_chip * HEAD_DIM
     attn_out = ttnn.reshape(attn_out, (B, S_total, d_out))
 
-    txt_a = attn_out[:, :txt_seq, :]
-    img_a = attn_out[:, txt_seq:, :]
+    txt_a = attn_out[:, :txt_seq_pad, :]
+    img_a = attn_out[:, txt_seq_pad:, :]
 
     # Output proj (row-parallel if TP)
     img_a = ttnn.matmul(img_a, blk.img_to_out)
@@ -296,22 +316,24 @@ def block_forward(blk, img_hs, txt_hs, temb_tt, device):
     img_a = ttnn.add(img_a, blk.img_to_out_b)
     txt_a = ttnn.add(txt_a, blk.txt_to_out_b)
 
-    # Gated residual
-    img_hs = ttnn.add(img_hs, ttnn.multiply(i_g1_e, img_a))
-    txt_hs = ttnn.add(txt_hs, ttnn.multiply(t_g1_e, txt_a))
+    # Gated residual (attention)
+    i_g1 = ttnn.reshape(i_g1, (1, img_seq_pad, D))
+    t_g1 = ttnn.reshape(t_g1, (1, txt_seq_pad, D))
+    img_hs = ttnn.add(img_hs, ttnn.multiply(i_g1, img_a))
+    txt_hs = ttnn.add(txt_hs, ttnn.multiply(t_g1, txt_a))
 
-    # FFN
-    i_sh2_e = expand_mod_tt(i_sh2, img_seq, device)
-    i_sc2_e = expand_mod_tt(i_sc2, img_seq, device)
-    i_g2_e = expand_mod_tt(i_g2, img_seq, device)
-    t_sh2_e = expand_mod_tt(t_sh2, txt_seq, device)
-    t_sc2_e = expand_mod_tt(t_sc2, txt_seq, device)
-    t_g2_e = expand_mod_tt(t_g2, txt_seq, device)
+    # FFN modulation
+    i_sh2 = ttnn.reshape(i_sh2, (1, img_seq_pad, D))
+    i_sc2 = ttnn.reshape(i_sc2, (1, img_seq_pad, D))
+    i_g2 = ttnn.reshape(i_g2, (1, img_seq_pad, D))
+    t_sh2 = ttnn.reshape(t_sh2, (1, txt_seq_pad, D))
+    t_sc2 = ttnn.reshape(t_sc2, (1, txt_seq_pad, D))
+    t_g2 = ttnn.reshape(t_g2, (1, txt_seq_pad, D))
 
     img_n2 = ttnn.layer_norm(img_hs)
-    img_m2 = ttnn.add(ttnn.multiply(img_n2, ttnn.add(i_sc2_e, 1.0)), i_sh2_e)
+    img_m2 = ttnn.add(ttnn.multiply(img_n2, ttnn.add(i_sc2, 1.0)), i_sh2)
     txt_n2 = ttnn.layer_norm(txt_hs)
-    txt_m2 = ttnn.add(ttnn.multiply(txt_n2, ttnn.add(t_sc2_e, 1.0)), t_sh2_e)
+    txt_m2 = ttnn.add(ttnn.multiply(txt_n2, ttnn.add(t_sc2, 1.0)), t_sh2)
 
     # FFN fc1 + bias + GELU (column-parallel if TP, bias sharded to match)
     img_ff = ttnn.linear(img_m2, blk.img_ff1_w, bias=blk.img_ff1_b,
@@ -328,11 +350,16 @@ def block_forward(blk, img_hs, txt_hs, temb_tt, device):
     img_ff = ttnn.add(img_ff, blk.img_ff2_b)
     txt_ff = ttnn.add(txt_ff, blk.txt_ff2_b)
 
-    img_hs = ttnn.add(img_hs, ttnn.multiply(i_g2_e, img_ff))
-    txt_hs = ttnn.add(txt_hs, ttnn.multiply(t_g2_e, txt_ff))
+    # Gated residual (FFN)
+    img_hs = ttnn.add(img_hs, ttnn.multiply(i_g2, img_ff))
+    txt_hs = ttnn.add(txt_hs, ttnn.multiply(t_g2, txt_ff))
 
     return img_hs, txt_hs
 
+
+# ============================================================
+# Weight loading
+# ============================================================
 
 def load_block_weights_from_safetensors(weights_dir, block_idx):
     """Load one block's weights from safetensors files."""
@@ -348,6 +375,10 @@ def load_block_weights_from_safetensors(weights_dir, block_idx):
                     weights[key[len(prefix):]] = f.get_tensor(key).float()
     return weights
 
+
+# ============================================================
+# Main generation
+# ============================================================
 
 def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
     from diffusers import DiffusionPipeline
@@ -379,8 +410,6 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
                                            trace_region_size=100000000)
     else:
         device = ttnn.open_device(device_id=0)
-
-    # SDPA uses defaults (no explicit program_config needed)
 
     # Text encoding (CPU)
     print("Encoding text...")
@@ -420,6 +449,12 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
     img_seq_len = latents.shape[1]
     print(f"  Latents: {latents.shape} (img_seq={img_seq_len})")
 
+    # Compute padded sequence lengths
+    img_seq_pad = ((img_seq_len + TILE - 1) // TILE) * TILE
+    txt_seq_len = prompt_embeds.shape[1]
+    txt_seq_pad = ((txt_seq_len + TILE - 1) // TILE) * TILE
+    print(f"  Padded: img={img_seq_pad}, txt={txt_seq_pad}")
+
     # Scheduler
     sigmas = np.linspace(1.0, 1 / num_steps, num_steps)
     mu = calculate_shift(img_seq_len)
@@ -432,13 +467,35 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
     blocks = []
     for bi in range(60):
         w = load_block_weights_from_safetensors(weights_dir, bi)
-        blocks.append(TTNNBlock(w, device, use_tp=use_tp))
+        blocks.append(TTNNBlock(w, device, use_tp=use_tp,
+                                img_seq_pad=img_seq_pad, txt_seq_pad=txt_seq_pad))
         del w
         if (bi + 1) % 10 == 0:
             print(f"  Loaded {bi+1}/60 blocks")
     preload_time = time.perf_counter() - preload_start
     print(f"  Preloaded 60 blocks in {preload_time:.1f}s")
     gc.collect()
+
+    # Warmup: run one forward pass to compile all kernels
+    print("Warmup pass...")
+    warmup_start = time.perf_counter()
+    with torch.no_grad():
+        hs_cpu = transformer.img_in(latents)
+        ehs_cpu = transformer.txt_in(transformer.txt_norm(prompt_embeds))
+        ts_w = scheduler.timesteps[0].expand(1).to(torch.bfloat16) / 1000
+        temb_cpu = transformer.time_text_embed(ts_w.to(hs_cpu.dtype), hs_cpu).unsqueeze(1)
+
+    img_tt = to_tt(hs_cpu, device)
+    txt_tt = to_tt(ehs_cpu, device)
+    temb_tt = to_tt(temb_cpu, device)
+    temb_silu = ttnn.silu(temb_tt)
+
+    for bi in range(60):
+        img_tt, txt_tt = block_forward(blocks[bi], img_tt, txt_tt, temb_silu,
+                                       device, img_seq_len, txt_seq_len,
+                                       img_seq_pad, txt_seq_pad)
+    ttnn.synchronize_device(device)
+    print(f"  Warmup: {time.perf_counter()-warmup_start:.1f}s")
 
     # Denoising loop
     print(f"Denoising ({num_steps} steps, 60 blocks each)...")
@@ -459,11 +516,13 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
             img_tt = to_tt(hs_cpu, device)
             txt_tt = to_tt(ehs_cpu, device)
             temb_tt = to_tt(temb_cpu, device)
+            temb_silu = ttnn.silu(temb_tt)
 
             # 60 blocks on device (weights already resident)
             for bi in range(60):
-                img_tt, txt_tt = block_forward(blocks[bi], img_tt, txt_tt, temb_tt,
-                                               device)
+                img_tt, txt_tt = block_forward(blocks[bi], img_tt, txt_tt, temb_silu,
+                                               device, img_seq_len, txt_seq_len,
+                                               img_seq_pad, txt_seq_pad)
 
             ttnn.synchronize_device(device)
 
@@ -517,5 +576,5 @@ if __name__ == "__main__":
         weights_dir="/workspace/qwen-image-tt-xla/weights/qwen-image",
         prompt="A beautiful sunset over mountains",
         width=256, height=256,
-        num_steps=1, seed=42,
+        num_steps=20, seed=42,
     )
