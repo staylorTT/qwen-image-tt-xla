@@ -27,6 +27,8 @@ import safetensors.torch
 import ttnn
 
 from rope_layout import make_rope_layout_kernel
+from adaln_modulate import adaln_modulate_kernel
+from gated_residual import gated_residual_kernel
 
 TILE = 32
 N_HEADS = 24
@@ -238,7 +240,8 @@ def block_forward(blk, img_hs, txt_hs, temb_silu, device,
                   img_cos=None, img_sin_perm=None,
                   txt_cos=None, txt_sin_perm=None,
                   swap_perm=None,
-                  rope_kernel=None, rope_scratch=None):
+                  rope_kernel=None, rope_scratch=None,
+                  adaln_scratch=None, gated_res_scratch=None):
     """Forward one MMDiT block on device. All tensors are 3D: [1, S, D].
     RoPE tables: [S_pad, heads_per_chip*HEAD_DIM] 2D on device.
     swap_perm: [HEAD_DIM, HEAD_DIM] permutation matrix for adjacent-element swap.
@@ -272,19 +275,16 @@ def block_forward(blk, img_hs, txt_hs, temb_silu, device,
     t_sc2 = ttnn.slice(txt_adaln, [0, 4*D], [txt_seq_pad, 5*D])
     t_g2 = ttnn.slice(txt_adaln, [0, 5*D], [txt_seq_pad, 6*D])
 
-    # Reshape slices to 3D to match hidden states
-    i_sh1 = ttnn.reshape(i_sh1, (1, img_seq_pad, D))
-    i_sc1 = ttnn.reshape(i_sc1, (1, img_seq_pad, D))
-    i_g1 = ttnn.reshape(i_g1, (1, img_seq_pad, D))
-    t_sh1 = ttnn.reshape(t_sh1, (1, txt_seq_pad, D))
-    t_sc1 = ttnn.reshape(t_sc1, (1, txt_seq_pad, D))
-    t_g1 = ttnn.reshape(t_g1, (1, txt_seq_pad, D))
-
-    # LN + modulate
+    # AdaLN modulate via tt-lang kernel (slices are already 2D [S_pad, D])
     img_n = ttnn.layer_norm(img_hs)
-    img_m = ttnn.add(ttnn.multiply(img_n, ttnn.add(i_sc1, 1.0)), i_sh1)
+    img_n_2d = ttnn.reshape(img_n, (img_seq_pad, D))
+    adaln_modulate_kernel(img_n_2d, i_sh1, i_sc1, adaln_scratch["img"])
+    img_m = ttnn.reshape(adaln_scratch["img"], (1, img_seq_pad, D))
+
     txt_n = ttnn.layer_norm(txt_hs)
-    txt_m = ttnn.add(ttnn.multiply(txt_n, ttnn.add(t_sc1, 1.0)), t_sh1)
+    txt_n_2d = ttnn.reshape(txt_n, (txt_seq_pad, D))
+    adaln_modulate_kernel(txt_n_2d, t_sh1, t_sc1, adaln_scratch["txt"])
+    txt_m = ttnn.reshape(adaln_scratch["txt"], (1, txt_seq_pad, D))
 
     # QKV (column-parallel if TP, biases sharded to match)
     img_q = ttnn.linear(img_m, blk.img_to_q, bias=blk.img_to_q_b)
@@ -368,24 +368,27 @@ def block_forward(blk, img_hs, txt_hs, temb_silu, device,
     img_a = ttnn.add(img_a, blk.img_to_out_b)
     txt_a = ttnn.add(txt_a, blk.txt_to_out_b)
 
-    # Gated residual (attention)
-    i_g1 = ttnn.reshape(i_g1, (1, img_seq_pad, D))
-    t_g1 = ttnn.reshape(t_g1, (1, txt_seq_pad, D))
-    img_hs = ttnn.add(img_hs, ttnn.multiply(i_g1, img_a))
-    txt_hs = ttnn.add(txt_hs, ttnn.multiply(t_g1, txt_a))
+    # Gated residual (attention) via tt-lang kernel
+    img_hs_2d = ttnn.reshape(img_hs, (img_seq_pad, D))
+    img_a_2d = ttnn.reshape(img_a, (img_seq_pad, D))
+    gated_residual_kernel(img_hs_2d, img_a_2d, i_g1, gated_res_scratch["img"])
+    img_hs = ttnn.reshape(gated_res_scratch["img"], (1, img_seq_pad, D))
 
-    # FFN modulation
-    i_sh2 = ttnn.reshape(i_sh2, (1, img_seq_pad, D))
-    i_sc2 = ttnn.reshape(i_sc2, (1, img_seq_pad, D))
-    i_g2 = ttnn.reshape(i_g2, (1, img_seq_pad, D))
-    t_sh2 = ttnn.reshape(t_sh2, (1, txt_seq_pad, D))
-    t_sc2 = ttnn.reshape(t_sc2, (1, txt_seq_pad, D))
-    t_g2 = ttnn.reshape(t_g2, (1, txt_seq_pad, D))
+    txt_hs_2d = ttnn.reshape(txt_hs, (txt_seq_pad, D))
+    txt_a_2d = ttnn.reshape(txt_a, (txt_seq_pad, D))
+    gated_residual_kernel(txt_hs_2d, txt_a_2d, t_g1, gated_res_scratch["txt"])
+    txt_hs = ttnn.reshape(gated_res_scratch["txt"], (1, txt_seq_pad, D))
 
+    # FFN AdaLN modulate via tt-lang kernel
     img_n2 = ttnn.layer_norm(img_hs)
-    img_m2 = ttnn.add(ttnn.multiply(img_n2, ttnn.add(i_sc2, 1.0)), i_sh2)
+    img_n2_2d = ttnn.reshape(img_n2, (img_seq_pad, D))
+    adaln_modulate_kernel(img_n2_2d, i_sh2, i_sc2, adaln_scratch["img"])
+    img_m2 = ttnn.reshape(adaln_scratch["img"], (1, img_seq_pad, D))
+
     txt_n2 = ttnn.layer_norm(txt_hs)
-    txt_m2 = ttnn.add(ttnn.multiply(txt_n2, ttnn.add(t_sc2, 1.0)), t_sh2)
+    txt_n2_2d = ttnn.reshape(txt_n2, (txt_seq_pad, D))
+    adaln_modulate_kernel(txt_n2_2d, t_sh2, t_sc2, adaln_scratch["txt"])
+    txt_m2 = ttnn.reshape(adaln_scratch["txt"], (1, txt_seq_pad, D))
 
     # FFN fc1 + bias + GELU (column-parallel if TP, bias sharded to match)
     img_ff = ttnn.linear(img_m2, blk.img_ff1_w, bias=blk.img_ff1_b,
@@ -402,9 +405,16 @@ def block_forward(blk, img_hs, txt_hs, temb_silu, device,
     img_ff = ttnn.add(img_ff, blk.img_ff2_b)
     txt_ff = ttnn.add(txt_ff, blk.txt_ff2_b)
 
-    # Gated residual (FFN)
-    img_hs = ttnn.add(img_hs, ttnn.multiply(i_g2, img_ff))
-    txt_hs = ttnn.add(txt_hs, ttnn.multiply(t_g2, txt_ff))
+    # Gated residual (FFN) via tt-lang kernel
+    img_hs_2d = ttnn.reshape(img_hs, (img_seq_pad, D))
+    img_ff_2d = ttnn.reshape(img_ff, (img_seq_pad, D))
+    gated_residual_kernel(img_hs_2d, img_ff_2d, i_g2, gated_res_scratch["img"])
+    img_hs = ttnn.reshape(gated_res_scratch["img"], (1, img_seq_pad, D))
+
+    txt_hs_2d = ttnn.reshape(txt_hs, (txt_seq_pad, D))
+    txt_ff_2d = ttnn.reshape(txt_ff, (txt_seq_pad, D))
+    gated_residual_kernel(txt_hs_2d, txt_ff_2d, t_g2, gated_res_scratch["txt"])
+    txt_hs = ttnn.reshape(gated_res_scratch["txt"], (1, txt_seq_pad, D))
 
     return img_hs, txt_hs
 
@@ -576,6 +586,16 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
         "txt_k": zeros_tt((heads_per_chip * txt_seq_pad, HEAD_DIM), device),
         "txt_v": zeros_tt((heads_per_chip * txt_seq_pad, HEAD_DIM), device),
     }
+    # AdaLN modulate scratch (2D): reused across all blocks
+    adaln_scratch = {
+        "img": zeros_tt((img_seq_pad, HIDDEN_DIM), device),
+        "txt": zeros_tt((txt_seq_pad, HIDDEN_DIM), device),
+    }
+    # Gated residual scratch (2D): reused across all blocks
+    gated_res_scratch = {
+        "img": zeros_tt((img_seq_pad, HIDDEN_DIM), device),
+        "txt": zeros_tt((txt_seq_pad, HIDDEN_DIM), device),
+    }
     print(f"  RoPE kernel built, scratch allocated")
     print(f"  [TIMING] RoPE + upload: {time.perf_counter()-t0:.1f}s")
 
@@ -617,7 +637,8 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
                                        img_cos_tt, img_sin_perm_tt,
                                        txt_cos_tt, txt_sin_perm_tt,
                                        swap_perm_tt,
-                                       rope_kernel, rope_scratch)
+                                       rope_kernel, rope_scratch,
+                                       adaln_scratch, gated_res_scratch)
     ttnn.synchronize_device(device)
     print(f"  Warmup: {time.perf_counter()-warmup_start:.1f}s")
 
@@ -632,7 +653,8 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
                                            img_cos_tt, img_sin_perm_tt,
                                            txt_cos_tt, txt_sin_perm_tt,
                                            swap_perm_tt,
-                                           rope_kernel, rope_scratch)
+                                           rope_kernel, rope_scratch,
+                                       adaln_scratch, gated_res_scratch)
 
     print("Capturing trace...")
     trace_start = time.perf_counter()
@@ -748,6 +770,6 @@ if __name__ == "__main__":
     generate(
         weights_dir="/workspace/qwen-image-tt-xla/weights/qwen-image",
         prompt="A beautiful sunset over mountains",
-        width=256, height=256,
+        width=512, height=512,
         num_steps=3, seed=42,
     )
