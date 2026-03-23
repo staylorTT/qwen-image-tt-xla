@@ -100,6 +100,17 @@ def from_tt(t, device=None):
     return ttnn.to_torch(t).float()
 
 
+def make_swap_perm_matrix(dim):
+    """Build [dim, dim] permutation matrix that swaps adjacent pairs.
+    [x0,x1,x2,x3,...] @ P = [x1,x0,x3,x2,...].
+    Used for RoPE rotate_half on device after QK-norm."""
+    P = torch.zeros(dim, dim)
+    for i in range(0, dim, 2):
+        P[i, i + 1] = 1.0
+        P[i + 1, i] = 1.0
+    return P
+
+
 def expand_bias(bias_1d, seq_pad):
     """Pre-expand 1D bias to [seq_pad, D] for use with ttnn.linear or ttnn.add."""
     return bias_1d.unsqueeze(0).expand(seq_pad, -1).contiguous().to(torch.bfloat16)
@@ -221,8 +232,13 @@ def expand_adaln(silu_cond, mod_w, mod_b, n_repeat):
 # ============================================================
 
 def block_forward(blk, img_hs, txt_hs, temb_silu, device,
-                  img_seq, txt_seq, img_seq_pad, txt_seq_pad):
-    """Forward one MMDiT block on device. All tensors are 3D: [1, S, D]."""
+                  img_seq, txt_seq, img_seq_pad, txt_seq_pad,
+                  img_cos=None, img_sin_perm=None,
+                  txt_cos=None, txt_sin_perm=None,
+                  swap_perm=None):
+    """Forward one MMDiT block on device. All tensors are 3D: [1, S, D].
+    RoPE tables: [1, S_pad, heads_per_chip, D] pre-expanded on device.
+    swap_perm: [HEAD_DIM, HEAD_DIM] permutation matrix for adjacent-element swap."""
     D = HIDDEN_DIM
     use_tp = blk.use_tp and N_CHIPS > 1
     heads_per_chip = N_HEADS // N_CHIPS if use_tp else N_HEADS
@@ -286,6 +302,18 @@ def block_forward(blk, img_hs, txt_hs, temb_silu, device,
     img_k = ttnn.rms_norm(img_k, weight=blk.norm_k)
     txt_q = ttnn.rms_norm(txt_q, weight=blk.norm_added_q)
     txt_k = ttnn.rms_norm(txt_k, weight=blk.norm_added_k)
+
+    # RoPE via permutation matrix: swap AFTER QK-norm for correctness
+    # q_swap = q @ P (adjacent element swap), then q_roped = q * cos + q_swap * sin_perm
+    if img_cos is not None and swap_perm is not None:
+        img_q_swap = ttnn.matmul(img_q, swap_perm)
+        img_k_swap = ttnn.matmul(img_k, swap_perm)
+        txt_q_swap = ttnn.matmul(txt_q, swap_perm)
+        txt_k_swap = ttnn.matmul(txt_k, swap_perm)
+        img_q = ttnn.add(ttnn.multiply(img_q, img_cos), ttnn.multiply(img_q_swap, img_sin_perm))
+        img_k = ttnn.add(ttnn.multiply(img_k, img_cos), ttnn.multiply(img_k_swap, img_sin_perm))
+        txt_q = ttnn.add(ttnn.multiply(txt_q, txt_cos), ttnn.multiply(txt_q_swap, txt_sin_perm))
+        txt_k = ttnn.add(ttnn.multiply(txt_k, txt_cos), ttnn.multiply(txt_k_swap, txt_sin_perm))
 
     # Joint SDPA
     q = ttnn.concat([txt_q, img_q], dim=1)
@@ -461,6 +489,46 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
     scheduler.set_timesteps(num_steps, sigmas=sigmas, mu=mu)
     scheduler.set_begin_index(0)
 
+    # RoPE: compute cos/sin tables on CPU, expand to [1, S_pad, H, D], upload once
+    heads_per_chip = N_HEADS // N_CHIPS if use_tp else N_HEADS
+    print("Computing RoPE tables...")
+    img_shapes = [[(1, latent_h // 2, latent_w // 2)]]
+    txt_seq_lens_list = [txt_seq_len]
+    img_fc, txt_fc = transformer.pos_embed(img_shapes, txt_seq_lens_list,
+                                            device=torch.device("cpu"))
+    # img_fc: [img_seq, D/2] complex, txt_fc: [txt_seq, D/2] complex
+    def build_rope_tables(complex_freqs, seq_pad, n_heads):
+        cos_raw = complex_freqs.real.float().repeat_interleave(2, dim=-1)  # [S, D]
+        sin_raw = complex_freqs.imag.float().repeat_interleave(2, dim=-1)  # [S, D]
+        sign = torch.ones(HEAD_DIM)
+        sign[0::2] = -1
+        sin_perm_raw = sin_raw * sign.unsqueeze(0)  # [S, D]
+        # Expand to [1, S_pad, H, D] and pad seq if needed
+        S = cos_raw.shape[0]
+        cos_4d = cos_raw[:min(S, seq_pad)].unsqueeze(0).unsqueeze(2).expand(1, -1, n_heads, HEAD_DIM)
+        sin_perm_4d = sin_perm_raw[:min(S, seq_pad)].unsqueeze(0).unsqueeze(2).expand(1, -1, n_heads, HEAD_DIM)
+        if S < seq_pad:
+            cos_4d = F.pad(cos_4d, (0, 0, 0, 0, 0, seq_pad - S))
+            sin_perm_4d = F.pad(sin_perm_4d, (0, 0, 0, 0, 0, seq_pad - S))
+        return cos_4d.contiguous().bfloat16(), sin_perm_4d.contiguous().bfloat16()
+
+    img_cos_pt, img_sin_perm_pt = build_rope_tables(img_fc, img_seq_pad, heads_per_chip)
+    txt_cos_pt, txt_sin_perm_pt = build_rope_tables(txt_fc, txt_seq_pad, heads_per_chip)
+    # Upload directly without to_tt padding (shapes already correct for 4D)
+    def upload_4d(t, dev):
+        return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
+                               device=dev, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                               **_mesh_kwargs(dev))
+    img_cos_tt = upload_4d(img_cos_pt, device)
+    img_sin_perm_tt = upload_4d(img_sin_perm_pt, device)
+    txt_cos_tt = upload_4d(txt_cos_pt, device)
+    txt_sin_perm_tt = upload_4d(txt_sin_perm_pt, device)
+    print(f"  RoPE: img_cos {img_cos_tt.shape}, txt_cos {txt_cos_tt.shape}")
+
+    # Permutation matrix for adjacent-element swap (used for RoPE after QK-norm)
+    swap_perm_tt = to_tt(make_swap_perm_matrix(HEAD_DIM), device)
+    print(f"  Swap perm: {swap_perm_tt.shape}")
+
     # Preload all 60 blocks onto device with TP sharding
     print("Preloading all 60 blocks onto device...")
     preload_start = time.perf_counter()
@@ -493,7 +561,10 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
     for bi in range(60):
         img_tt, txt_tt = block_forward(blocks[bi], img_tt, txt_tt, temb_silu,
                                        device, img_seq_len, txt_seq_len,
-                                       img_seq_pad, txt_seq_pad)
+                                       img_seq_pad, txt_seq_pad,
+                                       img_cos_tt, img_sin_perm_tt,
+                                       txt_cos_tt, txt_sin_perm_tt,
+                                       swap_perm_tt)
     ttnn.synchronize_device(device)
     print(f"  Warmup: {time.perf_counter()-warmup_start:.1f}s")
 
@@ -522,7 +593,10 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
             for bi in range(60):
                 img_tt, txt_tt = block_forward(blocks[bi], img_tt, txt_tt, temb_silu,
                                                device, img_seq_len, txt_seq_len,
-                                               img_seq_pad, txt_seq_pad)
+                                               img_seq_pad, txt_seq_pad,
+                                               img_cos_tt, img_sin_perm_tt,
+                                               txt_cos_tt, txt_sin_perm_tt,
+                                               swap_perm_tt)
 
             ttnn.synchronize_device(device)
 
