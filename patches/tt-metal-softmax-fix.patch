@@ -1,0 +1,123 @@
+diff --git a/ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attention/compute/softmax.cpp b/ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attention/compute/softmax.cpp
+index 3bb39aec0b..6e860a6c58 100644
+--- a/ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attention/compute/softmax.cpp
++++ b/ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attention/compute/softmax.cpp
+@@ -12,6 +12,7 @@
+ #include "compute_kernel_api/bcast.h"
+ #include "compute_kernel_api/softmax.h"
+ #include "compute_kernel_api/reduce.h"
++#include "compute_kernel_api/eltwise_unary/clamp.h"
+ 
+ // for scale+mask+softmax:
+ // bcast HW (mul by 1 tile)  example: (  [2,1,1024,64] * [1,1,32,32]  )
+@@ -40,8 +41,11 @@ void calc_numeric_stable(
+     tile_regs_release();
+     cb_push_back(cb_max, 1);
+ 
+-    // calculate x-max(x)
++    // calculate x-max(x), clamp to [-88, 0], then exp
+     exp_tile_init<EXP_APPROX>();
++    constexpr uint32_t clamp_min_bits = 0xC2B00000u;  // -88.0f
++    constexpr uint32_t clamp_max_bits = 0x00000000u;  //   0.0f
++    clamp_tile_init();
+     reconfig_data_format_srcb(cb_max);
+     cb_wait_front(cb_max, 1);
+     sub_bcast_cols_init_short(cb_in, cb_max);
+@@ -50,6 +54,10 @@ void calc_numeric_stable(
+         for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
+             sub_tiles_bcast_cols(cb_in, cb_max, wt + wt8, 0, wt8);
+         }
++        // Clamp (x - max) to safe exp range
++        for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
++            clamp_tile(wt8, clamp_min_bits, clamp_max_bits);
++        }
+         cb_reserve_back(cb_out, ndst);
+         for (uint32_t wt8 = 0; wt8 < ndst; wt8++) {
+             exp_tile<EXP_APPROX>(wt8);  // exp on DST[0]
+diff --git a/ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attention/compute/softmax_large_tensor.cpp b/ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attention/compute/softmax_large_tensor.cpp
+index 4779d501d3..f25ae383aa 100644
+--- a/ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attention/compute/softmax_large_tensor.cpp
++++ b/ttnn/cpp/ttnn/operations/normalization/softmax/device/kernels/attention/compute/softmax_large_tensor.cpp
+@@ -15,6 +15,7 @@
+ #include "compute_kernel_api/eltwise_unary/eltwise_unary.h"
+ #include "compute_kernel_api/eltwise_unary/sfpu_int_sum.h"
+ #include "compute_kernel_api/eltwise_unary/fill.h"
++#include "compute_kernel_api/eltwise_unary/clamp.h"
+ #include "compute_kernel_api.h"
+ 
+ #include "api/debug/assert.h"
+@@ -395,6 +396,14 @@ void exp_cb(uint32_t cb_in, uint32_t cb_out, uint32_t cb_max, const uint32_t cb_
+     copy_tile_init(cb_in);  // need to copy from CB to DST to be able to run sfpu math
+ #endif
+     exp_tile_init<EXP_APPROX>();
++    // Clamp (x - max) to [-88, 0] before exp to avoid precision issues
++    // with very large negative values. exp(-88) < FLT_MIN ≈ 0 in f32,
++    // so clamping doesn't change the mathematical result but prevents
++    // the hardware exp from producing garbage for extreme inputs.
++    // -88.0f = 0xC2B00000, 0.0f = 0x00000000
++    constexpr uint32_t clamp_min_bits = 0xC2B00000u;  // -88.0f
++    constexpr uint32_t clamp_max_bits = 0x00000000u;  //   0.0f
++    clamp_tile_init();
+     uint32_t loop = 0;
+     for (uint32_t cur_blk = 0; cur_blk < cb_length_t; cur_blk += blk) {
+         if (cb_length_t - cur_blk < blk) {
+@@ -407,6 +416,10 @@ void exp_cb(uint32_t cb_in, uint32_t cb_out, uint32_t cb_max, const uint32_t cb_
+         for (uint32_t cur_dst = 0; cur_dst < blk; cur_dst++) {
+             sub_tiles_bcast_cols(cb_in, cb_max, cur_dst, 0, cur_dst);
+         }
++        // Clamp after subtraction to safe exp input range
++        for (uint32_t cur_dst = 0; cur_dst < blk; cur_dst++) {
++            clamp_tile(cur_dst, clamp_min_bits, clamp_max_bits);
++        }
+ #else
+         for (uint32_t cur_dst = 0; cur_dst < blk; cur_dst++) {
+             copy_tile(cb_in, cur_dst, cur_dst);
+diff --git a/ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_operation.cpp b/ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_operation.cpp
+index b26063ad98..4b132de878 100644
+--- a/ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_operation.cpp
++++ b/ttnn/cpp/ttnn/operations/normalization/softmax/device/softmax_device_operation.cpp
+@@ -360,7 +360,7 @@ Tensor softmax(
+         input_tensor.device() != nullptr,
+         "input_tensor.device() == nullptr, No device found, move input_tensor to device");
+     const auto compute_kernel_config_val = init_device_compute_kernel_config(
+-        input_tensor.device()->arch(), compute_kernel_config, MathFidelity::HiFi4, true, is_fp32, false);
++        input_tensor.device()->arch(), compute_kernel_config, MathFidelity::HiFi4, false, is_fp32, false);
+     const auto rank = input_tensor.logical_shape().size();
+     const auto dim_calculated = dim < 0 ? rank + dim : dim;
+     if (rank > 4) {
+@@ -437,7 +437,7 @@ Tensor scale_mask_softmax(
+     // Constants
+     const auto is_fp32 = input_tensor.dtype() == DataType::FLOAT32;
+     const auto compute_kernel_config_val = init_device_compute_kernel_config(
+-        input_tensor.device()->arch(), compute_kernel_config, MathFidelity::HiFi4, true, is_fp32, false);
++        input_tensor.device()->arch(), compute_kernel_config, MathFidelity::HiFi4, false, is_fp32, false);
+ 
+     // Input tensor formatting
+     const ttnn::Shape input_pad_shape = ttnn::operations::data_movement::pad_to_tile_shape(input_tensor.padded_shape());
+@@ -521,7 +521,7 @@ Tensor softmax_in_place(
+     // Constants
+     const auto is_fp32 = input_tensor.dtype() == DataType::FLOAT32;
+     const auto compute_kernel_config_val = init_device_compute_kernel_config(
+-        input_tensor.device()->arch(), compute_kernel_config, MathFidelity::HiFi4, true, is_fp32, false);
++        input_tensor.device()->arch(), compute_kernel_config, MathFidelity::HiFi4, false, is_fp32, false);
+ 
+     // Operation specific checks
+     TT_FATAL(
+@@ -560,7 +560,7 @@ Tensor scale_mask_softmax_in_place(
+     // Constants
+     const auto is_fp32 = input_tensor.dtype() == DataType::FLOAT32;
+     const auto compute_kernel_config_val = init_device_compute_kernel_config(
+-        input_tensor.device()->arch(), compute_kernel_config, MathFidelity::HiFi4, true, is_fp32, false);
++        input_tensor.device()->arch(), compute_kernel_config, MathFidelity::HiFi4, false, is_fp32, false);
+     const auto rank = input_tensor.logical_shape().size();
+     const auto dim = rank - 1;
+ 
+@@ -590,7 +590,7 @@ Tensor scale_causal_mask_hw_dims_softmax_in_place(
+     // Constants
+     const auto is_fp32 = input_tensor.dtype() == DataType::FLOAT32;
+     const auto compute_kernel_config_val = init_device_compute_kernel_config(
+-        input_tensor.device()->arch(), compute_kernel_config, MathFidelity::HiFi4, true, is_fp32, false);
++        input_tensor.device()->arch(), compute_kernel_config, MathFidelity::HiFi4, false, is_fp32, false);
+     const auto rank = input_tensor.logical_shape().size();
+     const auto dim = rank - 1;
+ 

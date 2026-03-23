@@ -14,17 +14,27 @@ import torch_xla.runtime as xr
 
 os.environ["CONVERT_SHLO_TO_SHARDY"] = "1"
 os.environ["TTXLA_LOGGER_LEVEL"] = "DEBUG"
+
+# Set export path BEFORE device init
+EXPORT_DIR = "./ir_dump"
+os.makedirs(EXPORT_DIR, exist_ok=True)
+os.environ["TT_TORCH_EXPORT_PATH"] = EXPORT_DIR
+
 xr.use_spmd()
+
+# Set compile options before device type to avoid double-init
+try:
+    torch_xla.set_custom_compile_options({
+        "export_path": EXPORT_DIR,
+        "optimization_level": "1",
+    })
+except Exception as e:
+    print(f"  Note: set_custom_compile_options: {e}")
+
 xr.set_device_type("TT")
 
 from diffusers import DiffusionPipeline
 from utils.image_utils import pack_latents
-
-# Set export path to dump IRs
-EXPORT_DIR = "./ir_dump"
-torch_xla.set_custom_compile_options({
-    "export_path": EXPORT_DIR,
-})
 
 def complex_to_real_rope(complex_freqs):
     cos = complex_freqs.real.float().repeat_interleave(2, dim=-1).unsqueeze(1)
