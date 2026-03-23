@@ -29,6 +29,7 @@ import ttnn
 from rope_layout import make_rope_layout_kernel
 from adaln_modulate import adaln_modulate_kernel
 from gated_residual import gated_residual_kernel
+from layernorm_adaln import make_layernorm_adaln_kernel
 
 TILE = 32
 N_HEADS = 24
@@ -48,7 +49,7 @@ def _mesh_kwargs(device):
     return {}
 
 
-def to_tt(t, device):
+def to_tt(t, device, mem=None):
     """Convert torch tensor to ttnn, replicated across mesh."""
     if t.dim() == 1:
         t = t.unsqueeze(0)
@@ -59,15 +60,17 @@ def to_tt(t, device):
         t = F.pad(t, (0, pw, 0, ph))
     return ttnn.from_torch(t.contiguous().to(torch.bfloat16),
                            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                           device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                           device=device,
+                           memory_config=mem or ttnn.DRAM_MEMORY_CONFIG,
                            **_mesh_kwargs(device))
 
 
-def to_tt_1d(t, device):
+def to_tt_1d(t, device, mem=None):
     """Convert 1D bias for ttnn.linear, replicated across mesh."""
     return ttnn.from_torch(t.unsqueeze(0).to(torch.bfloat16),
                            dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                           device=device, memory_config=ttnn.DRAM_MEMORY_CONFIG,
+                           device=device,
+                           memory_config=mem or ttnn.DRAM_MEMORY_CONFIG,
                            **_mesh_kwargs(device))
 
 
@@ -200,11 +203,11 @@ class TTNNBlock:
             self.txt_ff1_b = to_tt_1d(w["txt_mlp.net.0.proj.bias"], d)
             self.txt_ff2_b = to_tt_1d(w["txt_mlp.net.2.bias"], d)
 
-        # QK norm (replicated)
-        self.norm_q = to_tt_1d(w["attn.norm_q.weight"], d)
-        self.norm_k = to_tt_1d(w["attn.norm_k.weight"], d)
-        self.norm_added_q = to_tt_1d(w["attn.norm_added_q.weight"], d)
-        self.norm_added_k = to_tt_1d(w["attn.norm_added_k.weight"], d)
+        # QK norm (replicated, small -> L1)
+        self.norm_q = to_tt_1d(w["attn.norm_q.weight"], d, mem=ttnn.L1_MEMORY_CONFIG)
+        self.norm_k = to_tt_1d(w["attn.norm_k.weight"], d, mem=ttnn.L1_MEMORY_CONFIG)
+        self.norm_added_q = to_tt_1d(w["attn.norm_added_q.weight"], d, mem=ttnn.L1_MEMORY_CONFIG)
+        self.norm_added_k = to_tt_1d(w["attn.norm_added_k.weight"], d, mem=ttnn.L1_MEMORY_CONFIG)
 
     def deallocate(self):
         for attr in list(vars(self).keys()):
@@ -241,7 +244,8 @@ def block_forward(blk, img_hs, txt_hs, temb_silu, device,
                   txt_cos=None, txt_sin_perm=None,
                   swap_perm=None,
                   rope_kernel=None, rope_scratch=None,
-                  adaln_scratch=None, gated_res_scratch=None):
+                  adaln_scratch=None, gated_res_scratch=None,
+                  ln_adaln_kernel=None, scaler_tt=None, mean_scale_tt=None):
     """Forward one MMDiT block on device. All tensors are 3D: [1, S, D].
     RoPE tables: [S_pad, heads_per_chip*HEAD_DIM] 2D on device.
     swap_perm: [HEAD_DIM, HEAD_DIM] permutation matrix for adjacent-element swap.
@@ -275,15 +279,13 @@ def block_forward(blk, img_hs, txt_hs, temb_silu, device,
     t_sc2 = ttnn.slice(txt_adaln, [0, 4*D], [txt_seq_pad, 5*D])
     t_g2 = ttnn.slice(txt_adaln, [0, 5*D], [txt_seq_pad, 6*D])
 
-    # AdaLN modulate via tt-lang kernel (slices are already 2D [S_pad, D])
-    img_n = ttnn.layer_norm(img_hs)
-    img_n_2d = ttnn.reshape(img_n, (img_seq_pad, D))
-    adaln_modulate_kernel(img_n_2d, i_sh1, i_sc1, adaln_scratch["img"])
+    # Fused LayerNorm + AdaLN modulate via tt-lang kernel
+    img_hs_2d = ttnn.reshape(img_hs, (img_seq_pad, D))
+    ln_adaln_kernel(img_hs_2d, i_sh1, i_sc1, scaler_tt, mean_scale_tt, adaln_scratch["img"])
     img_m = ttnn.reshape(adaln_scratch["img"], (1, img_seq_pad, D))
 
-    txt_n = ttnn.layer_norm(txt_hs)
-    txt_n_2d = ttnn.reshape(txt_n, (txt_seq_pad, D))
-    adaln_modulate_kernel(txt_n_2d, t_sh1, t_sc1, adaln_scratch["txt"])
+    txt_hs_2d = ttnn.reshape(txt_hs, (txt_seq_pad, D))
+    ln_adaln_kernel(txt_hs_2d, t_sh1, t_sc1, scaler_tt, mean_scale_tt, adaln_scratch["txt"])
     txt_m = ttnn.reshape(adaln_scratch["txt"], (1, txt_seq_pad, D))
 
     # QKV (column-parallel if TP, biases sharded to match)
@@ -379,15 +381,13 @@ def block_forward(blk, img_hs, txt_hs, temb_silu, device,
     gated_residual_kernel(txt_hs_2d, txt_a_2d, t_g1, gated_res_scratch["txt"])
     txt_hs = ttnn.reshape(gated_res_scratch["txt"], (1, txt_seq_pad, D))
 
-    # FFN AdaLN modulate via tt-lang kernel
-    img_n2 = ttnn.layer_norm(img_hs)
-    img_n2_2d = ttnn.reshape(img_n2, (img_seq_pad, D))
-    adaln_modulate_kernel(img_n2_2d, i_sh2, i_sc2, adaln_scratch["img"])
+    # FFN: Fused LayerNorm + AdaLN modulate via tt-lang kernel
+    img_hs_2d = ttnn.reshape(img_hs, (img_seq_pad, D))
+    ln_adaln_kernel(img_hs_2d, i_sh2, i_sc2, scaler_tt, mean_scale_tt, adaln_scratch["img"])
     img_m2 = ttnn.reshape(adaln_scratch["img"], (1, img_seq_pad, D))
 
-    txt_n2 = ttnn.layer_norm(txt_hs)
-    txt_n2_2d = ttnn.reshape(txt_n2, (txt_seq_pad, D))
-    adaln_modulate_kernel(txt_n2_2d, t_sh2, t_sc2, adaln_scratch["txt"])
+    txt_hs_2d = ttnn.reshape(txt_hs, (txt_seq_pad, D))
+    ln_adaln_kernel(txt_hs_2d, t_sh2, t_sc2, scaler_tt, mean_scale_tt, adaln_scratch["txt"])
     txt_m2 = ttnn.reshape(adaln_scratch["txt"], (1, txt_seq_pad, D))
 
     # FFN fc1 + bias + GELU (column-parallel if TP, bias sharded to match)
@@ -539,6 +539,7 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
     scheduler.set_begin_index(0)
 
     # RoPE: compute cos/sin tables on CPU as 2D [S_pad, H*D], upload once
+    L1 = ttnn.L1_MEMORY_CONFIG
     t0 = time.perf_counter()
     heads_per_chip = N_HEADS // N_CHIPS if use_tp else N_HEADS
     d_per_chip = heads_per_chip * HEAD_DIM
@@ -567,14 +568,14 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
 
     img_cos_pt, img_sin_perm_pt = build_rope_tables_2d(img_fc, img_seq_pad, heads_per_chip)
     txt_cos_pt, txt_sin_perm_pt = build_rope_tables_2d(txt_fc, txt_seq_pad, heads_per_chip)
-    img_cos_tt = to_tt(img_cos_pt, device)
-    img_sin_perm_tt = to_tt(img_sin_perm_pt, device)
-    txt_cos_tt = to_tt(txt_cos_pt, device)
-    txt_sin_perm_tt = to_tt(txt_sin_perm_pt, device)
+    img_cos_tt = to_tt(img_cos_pt, device, mem=L1)
+    img_sin_perm_tt = to_tt(img_sin_perm_pt, device, mem=L1)
+    txt_cos_tt = to_tt(txt_cos_pt, device, mem=L1)
+    txt_sin_perm_tt = to_tt(txt_sin_perm_pt, device, mem=L1)
     print(f"  RoPE: img_cos {img_cos_tt.shape}, txt_cos {txt_cos_tt.shape}")
 
     # Permutation matrix for adjacent-element swap (used for RoPE after QK-norm)
-    swap_perm_tt = to_tt(make_swap_perm_matrix(HEAD_DIM), device)
+    swap_perm_tt = to_tt(make_swap_perm_matrix(HEAD_DIM), device, mem=L1)
 
     # Build tt-lang RoPE kernel + pre-allocate scratch outputs
     rope_kernel = make_rope_layout_kernel(heads_per_chip, head_tiles)
@@ -596,6 +597,11 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
         "img": zeros_tt((img_seq_pad, HIDDEN_DIM), device),
         "txt": zeros_tt((txt_seq_pad, HIDDEN_DIM), device),
     }
+    # Fused LayerNorm+AdaLN kernel + helper tensors (small -> L1)
+    dim_tiles = HIDDEN_DIM // TILE  # 96
+    ln_adaln_kernel = make_layernorm_adaln_kernel(dim_tiles)
+    scaler_tt = to_tt(torch.ones(TILE, TILE, dtype=torch.bfloat16), device, mem=L1)
+    mean_scale_tt = to_tt(torch.full((TILE, TILE), 1.0 / HIDDEN_DIM, dtype=torch.bfloat16), device, mem=L1)
     print(f"  RoPE kernel built, scratch allocated")
     print(f"  [TIMING] RoPE + upload: {time.perf_counter()-t0:.1f}s")
 
@@ -638,7 +644,8 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
                                        txt_cos_tt, txt_sin_perm_tt,
                                        swap_perm_tt,
                                        rope_kernel, rope_scratch,
-                                       adaln_scratch, gated_res_scratch)
+                                       adaln_scratch, gated_res_scratch,
+                                       ln_adaln_kernel, scaler_tt, mean_scale_tt)
     ttnn.synchronize_device(device)
     print(f"  Warmup: {time.perf_counter()-warmup_start:.1f}s")
 
@@ -654,7 +661,8 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
                                            txt_cos_tt, txt_sin_perm_tt,
                                            swap_perm_tt,
                                            rope_kernel, rope_scratch,
-                                       adaln_scratch, gated_res_scratch)
+                                       adaln_scratch, gated_res_scratch,
+                                       ln_adaln_kernel, scaler_tt, mean_scale_tt)
 
     print("Capturing trace...")
     trace_start = time.perf_counter()
