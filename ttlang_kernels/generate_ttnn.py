@@ -552,6 +552,8 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
         ehs_cpu = transformer.txt_in(transformer.txt_norm(prompt_embeds))
         ts_w = scheduler.timesteps[0].expand(1).to(torch.bfloat16) / 1000
         temb_cpu = transformer.time_text_embed(ts_w.to(hs_cpu.dtype), hs_cpu).unsqueeze(1)
+        # Expand temb to fill all TILE rows so concat-repeat gives correct values
+        temb_cpu = temb_cpu.expand(1, TILE, -1).contiguous()
 
     img_tt = to_tt(hs_cpu, device)
     txt_tt = to_tt(ehs_cpu, device)
@@ -581,7 +583,9 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
             hs_cpu = transformer.img_in(latents)
             ehs_cpu = transformer.txt_in(transformer.txt_norm(prompt_embeds))
             temb_cpu = transformer.time_text_embed(ts.to(hs_cpu.dtype), hs_cpu)
-            temb_cpu = temb_cpu.unsqueeze(1)
+            # Keep original for norm_out, expand for device upload
+            temb_cpu_orig = temb_cpu
+            temb_cpu = temb_cpu.unsqueeze(1).expand(1, TILE, -1).contiguous()
 
             # Move to device
             img_tt = to_tt(hs_cpu, device)
@@ -602,7 +606,7 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
 
             # Post-block ops on CPU
             hs_out = from_tt(img_tt, device)[:, :img_seq_len, :HIDDEN_DIM].to(torch.bfloat16)
-            hs_out = transformer.norm_out(hs_out, temb_cpu.squeeze(1))
+            hs_out = transformer.norm_out(hs_out, temb_cpu_orig)
             noise_pred = transformer.proj_out(hs_out)
 
         # Scheduler step
