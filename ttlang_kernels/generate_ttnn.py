@@ -621,8 +621,42 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
     ttnn.synchronize_device(device)
     print(f"  Warmup: {time.perf_counter()-warmup_start:.1f}s")
 
-    # Denoising loop
-    print(f"Denoising ({num_steps} steps, 60 blocks each)...")
+    # Trace capture: silu + 60-block forward
+    def run_traced_forward():
+        nonlocal img_tt, txt_tt
+        temb_silu_t = ttnn.silu(temb_tt)
+        for bi in range(60):
+            img_tt, txt_tt = block_forward(blocks[bi], img_tt, txt_tt, temb_silu_t,
+                                           device, img_seq_len, txt_seq_len,
+                                           img_seq_pad, txt_seq_pad,
+                                           img_cos_tt, img_sin_perm_tt,
+                                           txt_cos_tt, txt_sin_perm_tt,
+                                           swap_perm_tt,
+                                           rope_kernel, rope_scratch)
+
+    print("Capturing trace...")
+    trace_start = time.perf_counter()
+    trace_id = ttnn.begin_trace_capture(device, cq_id=0)
+    run_traced_forward()
+    ttnn.end_trace_capture(device, trace_id, cq_id=0)
+    ttnn.synchronize_device(device)
+    print(f"  Trace captured in {time.perf_counter()-trace_start:.1f}s")
+
+    # Helper: create host tensor for copy_host_to_device_tensor
+    def to_tt_host(t):
+        """Create a tilized host tensor (no device) for copy_host_to_device_tensor."""
+        if t.dim() == 1:
+            t = t.unsqueeze(0)
+        h, w_dim = t.shape[-2], t.shape[-1]
+        ph = ((h + TILE - 1) // TILE) * TILE - h
+        pw = ((w_dim + TILE - 1) // TILE) * TILE - w_dim
+        if ph > 0 or pw > 0:
+            t = F.pad(t, (0, pw, 0, ph))
+        return ttnn.from_torch(t.contiguous().to(torch.bfloat16),
+                               dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+
+    # Denoising loop with tracing
+    print(f"Denoising ({num_steps} steps, 60 blocks each, TRACED)...")
     denoise_start = time.perf_counter()
 
     for step_i, t_val in enumerate(scheduler.timesteps):
@@ -639,24 +673,16 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
             temb_cpu = temb_cpu.unsqueeze(1).expand(1, TILE, -1).contiguous()
             cpu_pre_ms = (time.perf_counter() - t0) * 1000
 
-            # Move to device
+            # Copy inputs to pre-allocated device tensors (no allocation!)
             t0 = time.perf_counter()
-            img_tt = to_tt(hs_cpu, device)
-            txt_tt = to_tt(ehs_cpu, device)
-            temb_tt = to_tt(temb_cpu, device)
-            temb_silu = ttnn.silu(temb_tt)
+            ttnn.copy_host_to_device_tensor(to_tt_host(hs_cpu), img_tt)
+            ttnn.copy_host_to_device_tensor(to_tt_host(ehs_cpu), txt_tt)
+            ttnn.copy_host_to_device_tensor(to_tt_host(temb_cpu), temb_tt)
             h2d_ms = (time.perf_counter() - t0) * 1000
 
-            # 60 blocks on device (weights already resident)
+            # Execute traced forward (zero dispatch overhead!)
             t0 = time.perf_counter()
-            for bi in range(60):
-                img_tt, txt_tt = block_forward(blocks[bi], img_tt, txt_tt, temb_silu,
-                                               device, img_seq_len, txt_seq_len,
-                                               img_seq_pad, txt_seq_pad,
-                                               img_cos_tt, img_sin_perm_tt,
-                                               txt_cos_tt, txt_sin_perm_tt,
-                                               swap_perm_tt,
-                                               rope_kernel, rope_scratch)
+            ttnn.execute_trace(device, trace_id, cq_id=0, blocking=False)
             dispatch_ms = (time.perf_counter() - t0) * 1000
 
             t0 = time.perf_counter()
