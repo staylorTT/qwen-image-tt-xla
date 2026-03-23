@@ -26,6 +26,8 @@ import torch.nn.functional as F
 import safetensors.torch
 import ttnn
 
+from rope_layout import make_rope_layout_kernel
+
 TILE = 32
 N_HEADS = 24
 HEAD_DIM = 128
@@ -235,10 +237,13 @@ def block_forward(blk, img_hs, txt_hs, temb_silu, device,
                   img_seq, txt_seq, img_seq_pad, txt_seq_pad,
                   img_cos=None, img_sin_perm=None,
                   txt_cos=None, txt_sin_perm=None,
-                  swap_perm=None):
+                  swap_perm=None,
+                  rope_kernel=None, rope_scratch=None):
     """Forward one MMDiT block on device. All tensors are 3D: [1, S, D].
-    RoPE tables: [1, S_pad, heads_per_chip, D] pre-expanded on device.
-    swap_perm: [HEAD_DIM, HEAD_DIM] permutation matrix for adjacent-element swap."""
+    RoPE tables: [S_pad, heads_per_chip*HEAD_DIM] 2D on device.
+    swap_perm: [HEAD_DIM, HEAD_DIM] permutation matrix for adjacent-element swap.
+    rope_kernel: fused RoPE+layout tt-lang kernel (optional, falls back to ttnn).
+    rope_scratch: dict of pre-allocated output tensors for rope_kernel."""
     D = HIDDEN_DIM
     use_tp = blk.use_tp and N_CHIPS > 1
     heads_per_chip = N_HEADS // N_CHIPS if use_tp else N_HEADS
@@ -310,18 +315,37 @@ def block_forward(blk, img_hs, txt_hs, temb_silu, device,
         img_k_swap = ttnn.matmul(img_k, swap_perm)
         txt_q_swap = ttnn.matmul(txt_q, swap_perm)
         txt_k_swap = ttnn.matmul(txt_k, swap_perm)
-        img_q = ttnn.add(ttnn.multiply(img_q, img_cos), ttnn.multiply(img_q_swap, img_sin_perm))
-        img_k = ttnn.add(ttnn.multiply(img_k, img_cos), ttnn.multiply(img_k_swap, img_sin_perm))
-        txt_q = ttnn.add(ttnn.multiply(txt_q, txt_cos), ttnn.multiply(txt_q_swap, txt_sin_perm))
-        txt_k = ttnn.add(ttnn.multiply(txt_k, txt_cos), ttnn.multiply(txt_k_swap, txt_sin_perm))
 
-    # Joint SDPA
-    q = ttnn.concat([txt_q, img_q], dim=1)
-    k = ttnn.concat([txt_k, img_k], dim=1)
-    v = ttnn.concat([txt_v, img_v], dim=1)
-    q = ttnn.transpose(q, 1, 2)
-    k = ttnn.transpose(k, 1, 2)
-    v = ttnn.transpose(v, 1, 2)
+        # Fused RoPE + layout via tt-lang kernel
+        # Reshape 4D [1,S,H,D] -> 2D [S,H*D] for kernel
+        d_per_chip = heads_per_chip * HEAD_DIM
+        img_q_2d = ttnn.reshape(img_q, (img_seq_pad, d_per_chip))
+        img_qs_2d = ttnn.reshape(img_q_swap, (img_seq_pad, d_per_chip))
+        img_k_2d = ttnn.reshape(img_k, (img_seq_pad, d_per_chip))
+        img_ks_2d = ttnn.reshape(img_k_swap, (img_seq_pad, d_per_chip))
+        img_v_2d = ttnn.reshape(img_v, (img_seq_pad, d_per_chip))
+        txt_q_2d = ttnn.reshape(txt_q, (txt_seq_pad, d_per_chip))
+        txt_qs_2d = ttnn.reshape(txt_q_swap, (txt_seq_pad, d_per_chip))
+        txt_k_2d = ttnn.reshape(txt_k, (txt_seq_pad, d_per_chip))
+        txt_ks_2d = ttnn.reshape(txt_k_swap, (txt_seq_pad, d_per_chip))
+        txt_v_2d = ttnn.reshape(txt_v, (txt_seq_pad, d_per_chip))
+
+        # Run kernel: output is [H*S, D] (transposed layout)
+        rope_kernel(img_q_2d, img_qs_2d, img_k_2d, img_ks_2d, img_v_2d,
+                    img_cos, img_sin_perm,
+                    rope_scratch["img_q"], rope_scratch["img_k"], rope_scratch["img_v"])
+        rope_kernel(txt_q_2d, txt_qs_2d, txt_k_2d, txt_ks_2d, txt_v_2d,
+                    txt_cos, txt_sin_perm,
+                    rope_scratch["txt_q"], rope_scratch["txt_k"], rope_scratch["txt_v"])
+
+        # Concat in transposed layout: [H*S_txt, D] + [H*S_img, D] -> [H*S_total, D]
+        q = ttnn.concat([rope_scratch["txt_q"], rope_scratch["img_q"]], dim=0)
+        k = ttnn.concat([rope_scratch["txt_k"], rope_scratch["img_k"]], dim=0)
+        v = ttnn.concat([rope_scratch["txt_v"], rope_scratch["img_v"]], dim=0)
+        S_total = txt_seq_pad + img_seq_pad
+        q = ttnn.reshape(q, (B, heads_per_chip, S_total, HEAD_DIM))
+        k = ttnn.reshape(k, (B, heads_per_chip, S_total, HEAD_DIM))
+        v = ttnn.reshape(v, (B, heads_per_chip, S_total, HEAD_DIM))
 
     attn_out = ttnn.transformer.scaled_dot_product_attention(
         q, k, v, is_causal=False, scale=SCALE,
@@ -404,6 +428,13 @@ def load_block_weights_from_safetensors(weights_dir, block_idx):
     return weights
 
 
+def extract_block_weights(transformer, block_idx):
+    """Extract block weights from an already-loaded diffusers transformer.
+    Much faster than re-reading safetensors (~0s vs ~2.8s per block)."""
+    block = transformer.transformer_blocks[block_idx]
+    return {k: v.float() for k, v in block.state_dict().items()}
+
+
 # ============================================================
 # Main generation
 # ============================================================
@@ -416,20 +447,25 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
     total_start = time.perf_counter()
 
     # Load diffusers pipeline on CPU
+    t0 = time.perf_counter()
     print("Loading diffusers pipeline on CPU...")
     pipe = DiffusionPipeline.from_pretrained(weights_dir, torch_dtype=torch.bfloat16)
+    print(f"  [TIMING] from_pretrained: {time.perf_counter()-t0:.1f}s")
+    t0 = time.perf_counter()
     transformer = pipe.transformer.eval()
     vae = pipe.vae
     text_encoder = pipe.text_encoder
     tokenizer = pipe.tokenizer
     scheduler = pipe.scheduler
     vae_sf = 2 ** len(vae.temperal_downsample) if hasattr(vae, "temperal_downsample") else 8
+    print(f"  [TIMING] extract components: {time.perf_counter()-t0:.3f}s")
 
     width = (width // (vae_sf * 2)) * (vae_sf * 2)
     height = (height // (vae_sf * 2)) * (vae_sf * 2)
     print(f"  Resolution: {width}x{height}")
 
     # Open TT devices
+    t0 = time.perf_counter()
     print(f"Opening {N_CHIPS} TT devices...")
     use_tp = N_CHIPS > 1
     if use_tp:
@@ -438,8 +474,10 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
                                            trace_region_size=100000000)
     else:
         device = ttnn.open_device(device_id=0)
+    print(f"  [TIMING] open device: {time.perf_counter()-t0:.1f}s")
 
     # Text encoding (CPU)
+    t0 = time.perf_counter()
     print("Encoding text...")
     prompt_template = (
         "<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
@@ -465,6 +503,7 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
         [torch.cat([u, u.new_zeros(max_seq - u.size(0), u.size(1))]) for u in split_h]
     ).to(torch.bfloat16)
     print(f"  Text: {prompt_embeds.shape}")
+    print(f"  [TIMING] text encoding: {time.perf_counter()-t0:.1f}s")
 
     # Prepare latents
     latent_h = height // vae_sf
@@ -489,52 +528,63 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
     scheduler.set_timesteps(num_steps, sigmas=sigmas, mu=mu)
     scheduler.set_begin_index(0)
 
-    # RoPE: compute cos/sin tables on CPU, expand to [1, S_pad, H, D], upload once
+    # RoPE: compute cos/sin tables on CPU as 2D [S_pad, H*D], upload once
+    t0 = time.perf_counter()
     heads_per_chip = N_HEADS // N_CHIPS if use_tp else N_HEADS
+    d_per_chip = heads_per_chip * HEAD_DIM
+    head_tiles = HEAD_DIM // TILE
     print("Computing RoPE tables...")
     img_shapes = [[(1, latent_h // 2, latent_w // 2)]]
     txt_seq_lens_list = [txt_seq_len]
     img_fc, txt_fc = transformer.pos_embed(img_shapes, txt_seq_lens_list,
                                             device=torch.device("cpu"))
-    # img_fc: [img_seq, D/2] complex, txt_fc: [txt_seq, D/2] complex
-    def build_rope_tables(complex_freqs, seq_pad, n_heads):
+
+    def build_rope_tables_2d(complex_freqs, seq_pad, n_heads):
+        """Build 2D [S_pad, H*D] cos/sin_perm tables for RoPE kernel."""
         cos_raw = complex_freqs.real.float().repeat_interleave(2, dim=-1)  # [S, D]
         sin_raw = complex_freqs.imag.float().repeat_interleave(2, dim=-1)  # [S, D]
         sign = torch.ones(HEAD_DIM)
         sign[0::2] = -1
         sin_perm_raw = sin_raw * sign.unsqueeze(0)  # [S, D]
-        # Expand to [1, S_pad, H, D] and pad seq if needed
         S = cos_raw.shape[0]
-        cos_4d = cos_raw[:min(S, seq_pad)].unsqueeze(0).unsqueeze(2).expand(1, -1, n_heads, HEAD_DIM)
-        sin_perm_4d = sin_perm_raw[:min(S, seq_pad)].unsqueeze(0).unsqueeze(2).expand(1, -1, n_heads, HEAD_DIM)
+        # Repeat across heads: [S, D] -> [S, H*D]
+        cos_2d = cos_raw[:min(S, seq_pad)].repeat(1, n_heads)
+        sin_perm_2d = sin_perm_raw[:min(S, seq_pad)].repeat(1, n_heads)
         if S < seq_pad:
-            cos_4d = F.pad(cos_4d, (0, 0, 0, 0, 0, seq_pad - S))
-            sin_perm_4d = F.pad(sin_perm_4d, (0, 0, 0, 0, 0, seq_pad - S))
-        return cos_4d.contiguous().bfloat16(), sin_perm_4d.contiguous().bfloat16()
+            cos_2d = F.pad(cos_2d, (0, 0, 0, seq_pad - S))
+            sin_perm_2d = F.pad(sin_perm_2d, (0, 0, 0, seq_pad - S))
+        return cos_2d.contiguous().bfloat16(), sin_perm_2d.contiguous().bfloat16()
 
-    img_cos_pt, img_sin_perm_pt = build_rope_tables(img_fc, img_seq_pad, heads_per_chip)
-    txt_cos_pt, txt_sin_perm_pt = build_rope_tables(txt_fc, txt_seq_pad, heads_per_chip)
-    # Upload directly without to_tt padding (shapes already correct for 4D)
-    def upload_4d(t, dev):
-        return ttnn.from_torch(t, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT,
-                               device=dev, memory_config=ttnn.DRAM_MEMORY_CONFIG,
-                               **_mesh_kwargs(dev))
-    img_cos_tt = upload_4d(img_cos_pt, device)
-    img_sin_perm_tt = upload_4d(img_sin_perm_pt, device)
-    txt_cos_tt = upload_4d(txt_cos_pt, device)
-    txt_sin_perm_tt = upload_4d(txt_sin_perm_pt, device)
+    img_cos_pt, img_sin_perm_pt = build_rope_tables_2d(img_fc, img_seq_pad, heads_per_chip)
+    txt_cos_pt, txt_sin_perm_pt = build_rope_tables_2d(txt_fc, txt_seq_pad, heads_per_chip)
+    img_cos_tt = to_tt(img_cos_pt, device)
+    img_sin_perm_tt = to_tt(img_sin_perm_pt, device)
+    txt_cos_tt = to_tt(txt_cos_pt, device)
+    txt_sin_perm_tt = to_tt(txt_sin_perm_pt, device)
     print(f"  RoPE: img_cos {img_cos_tt.shape}, txt_cos {txt_cos_tt.shape}")
 
     # Permutation matrix for adjacent-element swap (used for RoPE after QK-norm)
     swap_perm_tt = to_tt(make_swap_perm_matrix(HEAD_DIM), device)
-    print(f"  Swap perm: {swap_perm_tt.shape}")
+
+    # Build tt-lang RoPE kernel + pre-allocate scratch outputs
+    rope_kernel = make_rope_layout_kernel(heads_per_chip, head_tiles)
+    rope_scratch = {
+        "img_q": zeros_tt((heads_per_chip * img_seq_pad, HEAD_DIM), device),
+        "img_k": zeros_tt((heads_per_chip * img_seq_pad, HEAD_DIM), device),
+        "img_v": zeros_tt((heads_per_chip * img_seq_pad, HEAD_DIM), device),
+        "txt_q": zeros_tt((heads_per_chip * txt_seq_pad, HEAD_DIM), device),
+        "txt_k": zeros_tt((heads_per_chip * txt_seq_pad, HEAD_DIM), device),
+        "txt_v": zeros_tt((heads_per_chip * txt_seq_pad, HEAD_DIM), device),
+    }
+    print(f"  RoPE kernel built, scratch allocated")
+    print(f"  [TIMING] RoPE + upload: {time.perf_counter()-t0:.1f}s")
 
     # Preload all 60 blocks onto device with TP sharding
     print("Preloading all 60 blocks onto device...")
     preload_start = time.perf_counter()
     blocks = []
     for bi in range(60):
-        w = load_block_weights_from_safetensors(weights_dir, bi)
+        w = extract_block_weights(transformer, bi)
         blocks.append(TTNNBlock(w, device, use_tp=use_tp,
                                 img_seq_pad=img_seq_pad, txt_seq_pad=txt_seq_pad))
         del w
@@ -566,7 +616,8 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
                                        img_seq_pad, txt_seq_pad,
                                        img_cos_tt, img_sin_perm_tt,
                                        txt_cos_tt, txt_sin_perm_tt,
-                                       swap_perm_tt)
+                                       swap_perm_tt,
+                                       rope_kernel, rope_scratch)
     ttnn.synchronize_device(device)
     print(f"  Warmup: {time.perf_counter()-warmup_start:.1f}s")
 
@@ -580,41 +631,59 @@ def generate(weights_dir, prompt, width=512, height=512, num_steps=20, seed=42):
 
         with torch.no_grad():
             # Pre-block ops on CPU
+            t0 = time.perf_counter()
             hs_cpu = transformer.img_in(latents)
             ehs_cpu = transformer.txt_in(transformer.txt_norm(prompt_embeds))
             temb_cpu = transformer.time_text_embed(ts.to(hs_cpu.dtype), hs_cpu)
-            # Keep original for norm_out, expand for device upload
             temb_cpu_orig = temb_cpu
             temb_cpu = temb_cpu.unsqueeze(1).expand(1, TILE, -1).contiguous()
+            cpu_pre_ms = (time.perf_counter() - t0) * 1000
 
             # Move to device
+            t0 = time.perf_counter()
             img_tt = to_tt(hs_cpu, device)
             txt_tt = to_tt(ehs_cpu, device)
             temb_tt = to_tt(temb_cpu, device)
             temb_silu = ttnn.silu(temb_tt)
+            h2d_ms = (time.perf_counter() - t0) * 1000
 
             # 60 blocks on device (weights already resident)
+            t0 = time.perf_counter()
             for bi in range(60):
                 img_tt, txt_tt = block_forward(blocks[bi], img_tt, txt_tt, temb_silu,
                                                device, img_seq_len, txt_seq_len,
                                                img_seq_pad, txt_seq_pad,
                                                img_cos_tt, img_sin_perm_tt,
                                                txt_cos_tt, txt_sin_perm_tt,
-                                               swap_perm_tt)
+                                               swap_perm_tt,
+                                               rope_kernel, rope_scratch)
+            dispatch_ms = (time.perf_counter() - t0) * 1000
 
+            t0 = time.perf_counter()
             ttnn.synchronize_device(device)
+            sync_ms = (time.perf_counter() - t0) * 1000
 
             # Post-block ops on CPU
+            t0 = time.perf_counter()
             hs_out = from_tt(img_tt, device)[:, :img_seq_len, :HIDDEN_DIM].to(torch.bfloat16)
+            d2h_ms = (time.perf_counter() - t0) * 1000
+
+            t0 = time.perf_counter()
             hs_out = transformer.norm_out(hs_out, temb_cpu_orig)
             noise_pred = transformer.proj_out(hs_out)
+            cpu_post_ms = (time.perf_counter() - t0) * 1000
 
         # Scheduler step
+        t0 = time.perf_counter()
         latents = scheduler.step(noise_pred, t_val, latents, return_dict=False)[0]
+        sched_ms = (time.perf_counter() - t0) * 1000
 
         step_ms = (time.perf_counter() - step_start) * 1000
         elapsed = time.perf_counter() - denoise_start
-        print(f"  Step {step_i+1}/{num_steps}: {step_ms:.0f}ms (total {elapsed:.1f}s)")
+        print(f"  Step {step_i+1}/{num_steps}: {step_ms:.0f}ms "
+              f"[cpu_pre={cpu_pre_ms:.0f} h2d={h2d_ms:.0f} dispatch={dispatch_ms:.0f} "
+              f"sync={sync_ms:.0f} d2h={d2h_ms:.0f} cpu_post={cpu_post_ms:.0f} "
+              f"sched={sched_ms:.0f}]")
 
     denoise_time = time.perf_counter() - denoise_start
     print(f"  Denoising: {denoise_time:.1f}s ({denoise_time/num_steps:.2f}s/step)")
@@ -654,5 +723,5 @@ if __name__ == "__main__":
         weights_dir="/workspace/qwen-image-tt-xla/weights/qwen-image",
         prompt="A beautiful sunset over mountains",
         width=256, height=256,
-        num_steps=20, seed=42,
+        num_steps=3, seed=42,
     )
